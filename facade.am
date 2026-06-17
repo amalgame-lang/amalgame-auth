@@ -1,0 +1,224 @@
+// amalgame-auth — HTTP authentication primitives for the Amalgame /
+// Mosaic stack, usable OUTSIDE the web framework.
+//
+// `BasicAuth` is RFC 7617 HTTP Basic as a pure HttpRequest ->
+// HttpResponse middleware (the same shape amalgame-web ships, but with
+// no dependency on the web framework — so a lean L7 server like WebDAV
+// can require auth without pulling all of amalgame-web). `Credentials`
+// is a multi-user store with scrypt password hashing (amalgame-crypto).
+//
+//   import Amalgame.Auth
+//
+//   let creds = new Credentials()
+//       .AddPassword("alice", "…")        // hashed with scrypt
+//       .Add("bob", bobScryptHash)         // or a precomputed hash
+//
+//   let auth = BasicAuth.ForCredentials("My Service", creds)
+//
+//   // middleware mode:
+//   let denied = auth.Reject(req)          // null = ok, else a 401
+//   if (denied != null) { return denied }
+//
+//   // identity mode (who is it?):
+//   let user = auth.Authenticate(req)      // "" if not authenticated
+//
+// SECURITY: Basic puts the password (base64-encoded, NOT encrypted) on
+// every request — ALWAYS deploy behind TLS. Passwords are stored only as
+// scrypt hashes; Verify is constant-time (amalgame-crypto).
+
+namespace Amalgame.Auth
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Net.Http
+import Amalgame.Crypto
+
+// ─────────────────────────────────────────────────────────────────────
+//  Credentials — a multi-user store of scrypt-hashed passwords.
+// ─────────────────────────────────────────────────────────────────────
+public class Credentials {
+    public Users: Map<string, string>   // username → "$scrypt$…" hash
+
+    public Credentials() { this.Users = new Map<string, string>() }
+
+    // Register a user with an already-computed scrypt hash (from
+    // crypto's Password.Hash — e.g. stored in a config file / KeePass).
+    public Credentials Add(name: string, passHash: string) {
+        this.Users.Set(name, passHash)
+        return this
+    }
+
+    // Register a user from a plaintext password (hashes it with scrypt
+    // here). Handy in tests / interactive setup; in production prefer
+    // Add() with a hash you generated offline.
+    public Credentials AddPassword(name: string, plaintext: string) {
+        this.Users.Set(name, Password.Hash(plaintext))
+        return this
+    }
+
+    public bool Has(name: string) { return this.Users.Has(name) }
+
+    // Constant-time scrypt verification (false for unknown user too).
+    public bool Verify(name: string, password: string) {
+        if (!this.Users.Has(name)) { return false }
+        return Password.Verify(password, this.Users.Get(name))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  BasicAuth — RFC 7617 middleware.
+// ─────────────────────────────────────────────────────────────────────
+public class BasicAuth {
+    public Realm:  string
+    // Credential store to check against. null ⇒ everything is rejected
+    // (fail closed).
+    public Creds:  Credentials
+    // When true, loopback / RFC1918 / ULA source addresses pass WITHOUT
+    // credentials (trusted-LAN convenience). Off by default.
+    public AllowPrivate: bool
+
+    public BasicAuth(realm: string) {
+        this.Realm = realm
+        this.Creds = null
+        this.AllowPrivate = false
+    }
+
+    public BasicAuth WithCredentials(c: Credentials) { this.Creds = c; return this }
+    public BasicAuth WithAllowPrivate()              { this.AllowPrivate = true; return this }
+
+    // Build a BasicAuth backed by a multi-user Credentials store.
+    public static BasicAuth ForCredentials(realm: string, creds: Credentials) {
+        let b = new BasicAuth(realm)
+        b.Creds = creds
+        return b
+    }
+
+    // Middleware: returns null when the request is authenticated (or
+    // LAN-bypassed), otherwise a ready 401 with WWW-Authenticate.
+    public HttpResponse Reject(req: HttpRequest) {
+        if (this.AllowPrivate && req != null && BasicAuth.IsPrivateAddr(req.RemoteAddr)) {
+            return null
+        }
+        if (String_Length(this.Authenticate(req)) > 0) { return null }
+        return this.Challenge()
+    }
+
+    // Identity: the verified username, or "" if not authenticated.
+    // Ignores AllowPrivate (a LAN bypass has no identity).
+    public string Authenticate(req: HttpRequest) {
+        if (req == null || this.Creds == null) { return "" }
+        let creds: string = this.decodeCreds(req)
+        let colon: int = String_IndexOf(creds, ":")
+        if (colon < 0) { return "" }
+        let user: string = String_Substring(creds, 0, colon)
+        let pwd:  string = String_Substring(creds, colon + 1, String_Length(creds) - colon - 1)
+        if (this.Creds.Verify(user, pwd)) { return user }
+        return ""
+    }
+
+    // The username carried by the request (parse only, no verification).
+    public string User(req: HttpRequest) {
+        if (req == null) { return "" }
+        let creds: string = this.decodeCreds(req)
+        let colon: int = String_IndexOf(creds, ":")
+        if (colon < 0) { return "" }
+        return String_Substring(creds, 0, colon)
+    }
+
+    // A bare 401 challenge (WWW-Authenticate: Basic realm=…).
+    public HttpResponse Challenge() {
+        let r = HttpResponse.New().Status(401)
+        r.Header("WWW-Authenticate", "Basic realm=\"" + this.escapeRealm(this.Realm) + "\", charset=\"UTF-8\"")
+        r.Header("Content-Length", "0")
+        return r
+    }
+
+    // ── internals ──────────────────────────────────────────────────
+
+    // Decode the "Authorization: Basic …" header → "user:pass" ("" if
+    // absent/not Basic). Whitespace-trimmed per RFC 7235.
+    string decodeCreds(req: HttpRequest) {
+        let h: string = req.Header("authorization")
+        if (String_Length(h) == 0) { return "" }
+        if (!String_StartsWith(String_ToLower(h), "basic ")) { return "" }
+        let enc: string = String_Trim(String_Substring(h, 6, String_Length(h) - 6))
+        return Bytes.ToString(BasicAuth.DecodeBase64Std(enc))
+    }
+
+    string escapeRealm(s: string) {
+        if (s == null) { return "" }
+        let q: string = String_FromByte(34)
+        let bs: string = String_FromByte(92)
+        let cr: string = String_FromByte(13)
+        let lf: string = String_FromByte(10)
+        let tab: string = String_FromByte(9)
+        var out: string = ""
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let ch: string = String_CharAt1(s, i)
+            if (ch != q && ch != bs && ch != cr && ch != lf && ch != tab) { out = out + ch }
+            i = i + 1
+        }
+        return out
+    }
+
+    // Standard base64 → bytes. Converts to base64url (+→-, /→_, drop =)
+    // then uses crypto's Bytes.FromBase64Url.
+    public static List<int> DecodeBase64Std(s: string) {
+        var url: string = ""
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let ch: string = String_CharAt1(s, i)
+            if (ch == "+")      { url = url + "-" }
+            else if (ch == "/") { url = url + "_" }
+            else if (ch == "=") { }
+            else                { url = url + ch }
+            i = i + 1
+        }
+        return Bytes.FromBase64Url(url)
+    }
+
+    // Bytes of a string → standard base64 (padded). Handy for building /
+    // testing Authorization headers.
+    public static string EncodeBase64Std(s: string) {
+        let url: string = Bytes.ToBase64Url(Bytes.FromString(s))
+        var std: string = ""
+        let n: int = String_Length(url)
+        var i: int = 0
+        while (i < n) {
+            let ch: string = String_CharAt1(url, i)
+            if (ch == "-")      { std = std + "+" }
+            else if (ch == "_") { std = std + "/" }
+            else                { std = std + ch }
+            i = i + 1
+        }
+        while (String_Length(std) % 4 != 0) { std = std + "=" }
+        return std
+    }
+
+    // Loopback / RFC1918 / link-local / ULA on an "ip" or "ip:port"
+    // string. Fail-closed: anything not positively private → false.
+    public static bool IsPrivateAddr(addr: string) {
+        if (String_Length(addr) == 0) { return false }
+        if (String_StartsWith(addr, "::1"))      { return true }
+        if (String_StartsWith(addr, "[::1]"))    { return true }
+        if (String_StartsWith(addr, "fc"))       { return true }
+        if (String_StartsWith(addr, "fd"))       { return true }
+        if (String_StartsWith(addr, "[fc"))      { return true }
+        if (String_StartsWith(addr, "[fd"))      { return true }
+        if (String_StartsWith(addr, "fe80"))     { return true }
+        if (String_StartsWith(addr, "[fe80"))    { return true }
+        if (String_StartsWith(addr, "127."))     { return true }
+        if (String_StartsWith(addr, "10."))      { return true }
+        if (String_StartsWith(addr, "192.168.")) { return true }
+        if (String_StartsWith(addr, "169.254.")) { return true }
+        var k: int = 16
+        while (k <= 31) {
+            if (String_StartsWith(addr, "172." + String_FromInt(k) + ".")) { return true }
+            k = k + 1
+        }
+        return false
+    }
+}

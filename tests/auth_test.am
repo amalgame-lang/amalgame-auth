@@ -1,0 +1,97 @@
+// Unit tests for amalgame-auth — Credentials (scrypt) + BasicAuth
+// (RFC 7617 middleware) against synthetic HttpRequests. No socket.
+
+namespace Tests
+
+import Amalgame.String
+import Amalgame.Collections
+import Amalgame.Net.Http
+import Amalgame.Crypto
+import Amalgame.Auth
+
+public class Counter {
+    public Pass:  int
+    public Total: int
+    public Counter() { this.Pass = 0; this.Total = 0 }
+    public void Ok(label: string, cond: bool) {
+        this.Total = this.Total + 1
+        if (cond) { Console.WriteLine("[PASS] " + label); this.Pass = this.Pass + 1 }
+        else      { Console.WriteLine("[FAIL] " + label) }
+    }
+}
+
+public class Program {
+    static HttpRequest req(method: string, basicCreds: string, remote: string) {
+        let r = new HttpRequest()
+        r.Method = method
+        r.Path   = "/"
+        if (String_Length(basicCreds) > 0) {
+            r.Headers.Set("authorization", "Basic " + BasicAuth.EncodeBase64Std(basicCreds))
+        }
+        r.RemoteAddr = remote
+        return r
+    }
+
+    public static void Main(string[] args) {
+        Console.WriteLine("amalgame-auth — BasicAuth + Credentials tests")
+        let c = new Counter()
+
+        // ── base64 round-trip ────────────────────────────────────
+        c.Ok("base64 std round-trips user:pass",
+            Bytes.ToString(BasicAuth.DecodeBase64Std(BasicAuth.EncodeBase64Std("alice:s3cret"))) == "alice:s3cret")
+
+        // ── Credentials (scrypt) ─────────────────────────────────
+        let creds = new Credentials()
+        creds.AddPassword("alice", "alicepw")
+        creds.Add("bob", Password.Hash("bobpw"))
+        c.Ok("credentials: correct password verifies", creds.Verify("alice", "alicepw"))
+        c.Ok("credentials: wrong password rejected", !creds.Verify("alice", "nope"))
+        c.Ok("credentials: unknown user rejected", !creds.Verify("carol", "x"))
+        c.Ok("credentials: second user (precomputed hash) verifies", creds.Verify("bob", "bobpw"))
+
+        // ── BasicAuth.ForCredentials ─────────────────────────────
+        let auth = BasicAuth.ForCredentials("Test Realm", creds)
+
+        // Authenticate → identity
+        c.Ok("authenticate: good creds → username",
+            auth.Authenticate(Program.req("GET", "alice:alicepw", "203.0.113.1:5")) == "alice")
+        c.Ok("authenticate: bad creds → \"\"",
+            String_Length(auth.Authenticate(Program.req("GET", "alice:WRONG", "203.0.113.1:5"))) == 0)
+        c.Ok("authenticate: no header → \"\"",
+            String_Length(auth.Authenticate(Program.req("GET", "", "203.0.113.1:5"))) == 0)
+
+        // Reject → 401 / null
+        c.Ok("reject: no creds → 401 + WWW-Authenticate",
+            Program.is401(auth.Reject(Program.req("GET", "", "203.0.113.1:5"))))
+        c.Ok("reject: good creds → null (pass)",
+            auth.Reject(Program.req("GET", "alice:alicepw", "203.0.113.1:5")) == null)
+        c.Ok("reject: bad creds → 401",
+            Program.is401(auth.Reject(Program.req("GET", "alice:WRONG", "203.0.113.1:5"))))
+
+        // User() parse-only
+        c.Ok("user: parses username without verifying",
+            auth.User(Program.req("GET", "alice:whatever", "203.0.113.1:5")) == "alice")
+
+        // ── AllowPrivate LAN bypass ──────────────────────────────
+        let lan = BasicAuth.ForCredentials("Test", creds).WithAllowPrivate()
+        c.Ok("allowPrivate: loopback bypasses creds → null",
+            lan.Reject(Program.req("GET", "", "127.0.0.1:5")) == null)
+        c.Ok("allowPrivate: public address still challenged → 401",
+            Program.is401(lan.Reject(Program.req("GET", "", "203.0.113.1:5"))))
+
+        // ── IsPrivateAddr classification ─────────────────────────
+        c.Ok("isPrivate: 10./192.168./172.16./::1 true, public false",
+            BasicAuth.IsPrivateAddr("10.0.0.4:9") && BasicAuth.IsPrivateAddr("192.168.1.2:9")
+            && BasicAuth.IsPrivateAddr("172.16.3.4:9") && BasicAuth.IsPrivateAddr("::1")
+            && !BasicAuth.IsPrivateAddr("8.8.8.8:9") && !BasicAuth.IsPrivateAddr("172.32.0.1:9"))
+
+        Console.WriteLine("")
+        Console.WriteLine("Summary: " + String_FromInt(c.Pass) + " passed, " + String_FromInt(c.Total - c.Pass) + " failed")
+    }
+
+    static bool is401(r: HttpResponse) {
+        if (r == null) { return false }
+        if (r.StatusCode != 401) { return false }
+        return String_Length(r.Headers.Get("WWW-Authenticate")) > 0
+    }
+}
