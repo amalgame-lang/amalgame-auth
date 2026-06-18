@@ -33,6 +33,15 @@ import Amalgame.String
 import Amalgame.Net.Http
 import Amalgame.Crypto
 
+@c {
+    #include <pthread.h>
+    #include <time.h>
+    // Process-wide lock for LoginGuard's in-memory counters. One guard per
+    // process is the norm; the lock just serializes the AM-map access from
+    // the server's per-connection threads.
+    static pthread_mutex_t amauth_lg_mu = PTHREAD_MUTEX_INITIALIZER;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 //  Credentials — a multi-user store of scrypt-hashed passwords.
 // ─────────────────────────────────────────────────────────────────────
@@ -220,5 +229,114 @@ public class BasicAuth {
             k = k + 1
         }
         return false
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  LoginGuard — brute-force / credential-stuffing lockout.
+//
+//  Count FAILED auth attempts per key (typically the client IP) and lock
+//  that key out once a threshold is crossed within a window — without
+//  penalising a user who simply reloads. Drive it around your credential
+//  check:
+//
+//      let lg = LoginGuard.New().WithMaxFailures(8).WithWindowSec(300).WithLockoutSec(900)
+//      let locked = lg.Check(ip)
+//      if (locked != null) { return locked }        // 429 + Retry-After
+//      if (ok) { lg.RecordSuccess(ip) } else { lg.RecordFailure(ip) }
+//
+//  Ported from amalgame-web's LoginGuard, but self-contained: the lock +
+//  monotonic clock are @c (no threading/datetime dependency). One guard
+//  per process (the lock is process-wide). Counting uses CLOCK_MONOTONIC
+//  (immune to NTP slews).
+// ─────────────────────────────────────────────────────────────────────
+public class LoginAttempt {
+    public Failures:         int
+    public WindowStartNanos: int
+    public LockedUntilNanos: int
+    public LoginAttempt() { this.Failures = 0; this.WindowStartNanos = 0; this.LockedUntilNanos = 0 }
+}
+
+public class LoginGuard {
+    public MaxFailures:  int
+    public WindowNanos:  int
+    public LockoutNanos: int
+    public Store:        Map<string, LoginAttempt>
+
+    public LoginGuard() {
+        this.MaxFailures  = 8
+        this.WindowNanos  = 300000000000    // 5 min  (full i64 literal)
+        this.LockoutNanos = 900000000000    // 15 min
+        this.Store        = new Map<string, LoginAttempt>()
+    }
+
+    public static LoginGuard New() { return new LoginGuard() }
+    public LoginGuard WithMaxFailures(n: int)  { this.MaxFailures  = n;                  return this }
+    public LoginGuard WithWindowSec(s: int)    { this.WindowNanos  = s * 1000000000;     return this }
+    public LoginGuard WithLockoutSec(s: int)   { this.LockoutNanos = s * 1000000000;     return this }
+
+    // 429 + Retry-After when `key` is locked out; null to proceed.
+    public HttpResponse Check(key: string) {
+        let remaining: int = this.lockRemainingSec(key)
+        if (remaining <= 0) { return null }
+        let r = HttpResponse.New().Status(429)
+        r.Header("Retry-After", String_FromInt(remaining))
+        r.Header("Content-Length", "0")
+        return r
+    }
+
+    public bool IsLocked(key: string) { return this.lockRemainingSec(key) > 0 }
+
+    // Record a failed attempt; crossing MaxFailures within the window arms
+    // the lock. A new window starts if the previous one elapsed.
+    public void RecordFailure(key: string) {
+        let now: int = LoginGuard.NowNanos()
+        LoginGuard.Lock()
+        var a: LoginAttempt = this.fetch(key)
+        if (a.LockedUntilNanos > now) { LoginGuard.Unlock(); return }
+        if (a.WindowStartNanos == 0 || (now - a.WindowStartNanos) > this.WindowNanos) {
+            a.Failures = 0; a.WindowStartNanos = now
+        }
+        a.Failures = a.Failures + 1
+        if (a.Failures >= this.MaxFailures) { a.LockedUntilNanos = now + this.LockoutNanos }
+        this.Store.Set(key, a)
+        LoginGuard.Unlock()
+    }
+
+    // Clear the counter + any lock for `key` (successful auth).
+    public void RecordSuccess(key: string) {
+        LoginGuard.Lock()
+        this.Store.Set(key, new LoginAttempt())
+        LoginGuard.Unlock()
+    }
+
+    // ── internals ──────────────────────────────────────────────────
+    int lockRemainingSec(key: string) {
+        let now: int = LoginGuard.NowNanos()
+        LoginGuard.Lock()
+        var rem: int = 0
+        if (this.Store.Has(key)) {
+            let a: LoginAttempt = this.Store.Get(key)
+            if (a.LockedUntilNanos > now) { rem = (a.LockedUntilNanos - now) / 1000000000 + 1 }
+        }
+        LoginGuard.Unlock()
+        return rem
+    }
+
+    LoginAttempt fetch(key: string) {
+        if (this.Store.Has(key)) { return this.Store.Get(key) }
+        return new LoginAttempt()
+    }
+
+    static void Lock()   { @c { pthread_mutex_lock(&amauth_lg_mu); } }
+    static void Unlock() { @c { pthread_mutex_unlock(&amauth_lg_mu); } }
+    static int NowNanos() {
+        var r: int = 0
+        @c {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            r = (i64) ts.tv_sec * 1000000000LL + (i64) ts.tv_nsec;
+        }
+        return r
     }
 }

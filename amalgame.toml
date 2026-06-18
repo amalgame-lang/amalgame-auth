@@ -1,8 +1,8 @@
 [package]
 name              = "amalgame-auth"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "HTTP authentication primitives for the Amalgame / Mosaic stack, reusable outside the web framework. RFC 7617 HTTP Basic (BasicAuth: realm + verifier closure, Reject/Authenticate/Challenge/User, optional loopback/RFC1918 LAN bypass) and a multi-user credential store (Credentials: scrypt password hashing via amalgame-crypto, constant-time verify). A pure HttpRequest -> HttpResponse middleware: no dependency on the web framework, so lean L7 servers (e.g. WebDAV) can require auth without pulling all of amalgame-web."
+description       = "HTTP authentication primitives for the Amalgame / Mosaic stack, reusable outside the web framework. RFC 7617 HTTP Basic (BasicAuth: Reject/Authenticate/Challenge/User, optional loopback/RFC1918 LAN bypass), a multi-user credential store (Credentials: scrypt hashing via amalgame-crypto, constant-time verify), and v0.2.0 LoginGuard — a brute-force / credential-stuffing lockout (count failed attempts per key, lock out with 429 + Retry-After), self-contained (lock + monotonic clock in @c, no extra deps). Pure HttpRequest -> HttpResponse middlewares: no dependency on the web framework, so lean L7 servers (e.g. WebDAV) can require auth + throttle abuse without pulling all of amalgame-web."
 required-amalgame = ">=0.8.72"
 schema-version    = 1
 
@@ -11,8 +11,8 @@ amalgame-net-http = ">=0.16.0"
 amalgame-crypto   = ">=0.6.0"
 
 [stdlib]
-classes   = ["Credentials", "BasicAuth"]
+classes   = ["Credentials", "BasicAuth", "LoginAttempt", "LoginGuard"]
 header    = "facade-stub.h"
 namespace = "Amalgame.Auth"
 facade    = "facade.am"
-libs      = []
+libs      = ["pthread"]

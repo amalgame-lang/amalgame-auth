@@ -85,6 +85,21 @@ public class Program {
             && BasicAuth.IsPrivateAddr("172.16.3.4:9") && BasicAuth.IsPrivateAddr("::1")
             && !BasicAuth.IsPrivateAddr("8.8.8.8:9") && !BasicAuth.IsPrivateAddr("172.32.0.1:9"))
 
+        // ── LoginGuard (anti-bruteforce) ─────────────────────────
+        let lg = LoginGuard.New().WithMaxFailures(3).WithWindowSec(300).WithLockoutSec(900)
+        let ip: string = "203.0.113.50"
+        c.Ok("guard: clean key not locked", !lg.IsLocked(ip) && lg.Check(ip) == null)
+        lg.RecordFailure(ip); lg.RecordFailure(ip)
+        c.Ok("guard: under threshold (2/3) still allowed", !lg.IsLocked(ip))
+        lg.RecordFailure(ip)                       // 3rd → locks
+        c.Ok("guard: at threshold → locked", lg.IsLocked(ip))
+        let blk = lg.Check(ip)
+        c.Ok("guard: Check → 429 + Retry-After",
+            blk != null && blk.StatusCode == 429 && String_Length(blk.Headers.Get("Retry-After")) > 0)
+        c.Ok("guard: another IP unaffected", !lg.IsLocked("198.51.100.7"))
+        lg.RecordSuccess(ip)
+        c.Ok("guard: RecordSuccess clears the lock", !lg.IsLocked(ip) && lg.Check(ip) == null)
+
         Console.WriteLine("")
         Console.WriteLine("Summary: " + String_FromInt(c.Pass) + " passed, " + String_FromInt(c.Total - c.Pass) + " failed")
     }
